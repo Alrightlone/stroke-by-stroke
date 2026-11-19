@@ -1,0 +1,783 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代码作画 · __TITLE__</title>
+<style>
+  :root {
+    --bg: #0f0d0b; --line: #2c2620; --text: #d8cebd; --muted: #857b6c; --accent: #c8a45a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .app {
+    min-height: 100%; display: grid; grid-template-rows: 1fr auto;
+    justify-items: center; align-items: center; gap: 14px; padding: 20px 16px 16px;
+  }
+  canvas {
+    display: block; max-width: 100%; max-height: calc(100vh - 150px);
+    background: #e0d4bc;
+    box-shadow: 0 0 0 1px #3a3229, 0 0 0 7px #17130f, 0 0 0 8px #3a3229, 0 24px 70px rgba(0, 0, 0, .65);
+  }
+  .hud { width: min(680px, 100%); }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  #passLabel { color: var(--text); font-weight: 600; letter-spacing: .04em; }
+  #counts { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { position: relative; display: flex; gap: 2px; height: 5px; margin: 8px 0 10px; }
+  .bar span { position: relative; background: var(--line); overflow: hidden; border-radius: 1px; }
+  .bar span i { position: absolute; inset: 0; width: 0; background: var(--accent); }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  button, select {
+    font: inherit; color: var(--text); background: transparent; border: 1px solid var(--line);
+    border-radius: 3px; padding: 4px 11px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--accent); }
+  button:disabled { opacity: .35; cursor: default; border-color: var(--line); }
+  .controls label { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .controls .spacer { flex: 1; }
+  select { padding: 4px 6px; }
+  select option { background: #1a1612; }
+</style>
+</head>
+<body>
+<div class="app">
+  <canvas id="painting"></canvas>
+  <div class="hud">
+    <div class="row">
+      <span id="passLabel">准备画布…</span>
+      <span id="counts"></span>
+    </div>
+    <div class="bar" id="bar"></div>
+    <div class="controls">
+      <button id="btnPlay">暂停</button>
+      <button id="btnStep" title="暂停后逐帧前进（→）">单帧 ▸</button>
+      <button id="btnRestart">重画</button>
+      <label>速度
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="btnSave">保存 PNG</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/*
+ * 代码作画：不调用图像模型，不用滤镜、颜色量化或贴图，只写一支画笔。
+ * 参考图只解码进内存做离屏取色，从不出现在画面上；
+ * 画面上的每个像素都来自 dab() 画出的一笔。
+ */
+
+// 这两项由 paint.mjs 在生成本文件时填入：参考图，和这张图自己的设置
+const REFERENCE_SRC = "__REFERENCE_DATA_URI__";
+const USER_CONFIG = __USER_CONFIG__;
+
+// 下面所有长度都是在 1122×1402 的画幅上调出来的，作画时按画幅面积等比缩放
+const BASE_SIDE = Math.sqrt(1122 * 1402);
+
+const CONFIG = {
+  seed: 20261117,
+  scale: 2,                    // 画布超采样：几何以参考图像素为单位，画布按此倍数放大
+  fps: 30,
+  ground: [222, 210, 186],     // 亚麻画布底色
+  light: [-0.62, -0.78],       // 光从左上来，决定厚涂的亮边落在笔触哪一侧
+
+  // 从粗到细六遍。width/seg/spacing/refSigma 是基准画幅上的像素。
+  //   stop    收笔色差：沿途参考色与笔上颜色相差超过它就提前收笔
+  //   errLo   画布与参考图的局部误差低于它，这一遍就不再动这里
+  //   impMin  细笔只落在重要度不低于它的地方（轮廓、重点区域），除非误差超过 errHi
+  passes: [
+    { name: "铺底",   width: 38,  seg: 15,  maxSegs: 5, spacing: 15,  refSigma: 5,   flow: 0, stop: 62,
+      bristles: 9, streak: 0.075, edge: 0.55, wobble: 0.30, frames: 56, ease: 2.0,
+      order: { dir: [0.5, 0.86], spatial: 0.72 } },
+    { name: "大色块", width: 19,  seg: 8,   maxSegs: 5, spacing: 8,   refSigma: 2.4, flow: 0, stop: 44,
+      errLo: 6, impMin: 0, errHi: 6,
+      bristles: 7, streak: 0.065, edge: 0.5, wobble: 0.24, frames: 72, ease: 1.25,
+      order: { dir: [-0.6, 0.8], spatial: 0.6 } },
+    { name: "塑形",   width: 9.5, seg: 4.5, maxSegs: 6, spacing: 4.2, refSigma: 1.1, flow: 1, stop: 32,
+      errLo: 6, impMin: 0.06, errHi: 11,
+      bristles: 4, streak: 0.05, edge: 0.42, wobble: 0.16, frames: 96, ease: 1,
+      order: { radial: true, spatial: 0.5, light: 0.15 } },
+    { name: "轮廓",   width: 4.8, seg: 2.8, maxSegs: 6, spacing: 2.3, refSigma: 0.5, flow: 1, stop: 24,
+      errLo: 5.5, impMin: 0.2, errHi: 13,
+      bristles: 0, edge: 0.3, wobble: 0.10, frames: 104, ease: 1,
+      order: { dir: [0.3, -0.95], spatial: 0.4, light: 0.2 } },
+    { name: "细节",   width: 2.4, seg: 1.8, maxSegs: 7, spacing: 1.3, refSigma: 0,   flow: 2, stop: 17,
+      errLo: 5, impMin: 0.34, errHi: 16,
+      bristles: 0, edge: 0, wobble: 0.06, frames: 104, ease: 1,
+      order: { radial: true, spatial: 0.3, light: 0.3 } },
+    { name: "点睛",   width: 1.2, seg: 1.1, maxSegs: 8, spacing: 0.8, refSigma: 0,   flow: 2, stop: 12,
+      errLo: 4.5, impMin: 0.5, errHi: 20,
+      bristles: 0, edge: 0, wobble: 0.04, frames: 64, ease: 1,
+      order: { spatial: 0, light: 0.4, focus: 0.4 } },
+  ],
+
+  // 三档方向场：[求梯度前的平滑, 结构张量的积分尺度]，粗笔看大形，细笔看发丝和睫毛
+  flowScales: [[3, 9], [1.5, 4], [0.7, 1.6]],
+
+  // 以下三项默认为空，可以在图片旁边的 <图片名>.paint.json 里按图给出。坐标是画幅宽高的比例。
+  center: null,                // 主体中心 [x, y]，决定从哪里画起；不给就取重要度的重心
+  focus: [],                   // 重点区域 { c: [x, y], r: [rx, ry], w }，半径按画幅宽度算；细笔优先落在这里
+  glints: [],                  // 高光 { c: [x, y], search, radius, alpha }：在 c 附近找参考图最亮的一点，点一下辉光
+
+  finish: {
+    glintFrames: 8,
+    vignette: 0.2, vignetteFrames: 8,
+    weave: { pitch: 2.4, dark: 0.05, light: 0.026 }, weaveFrames: 14,
+  },
+};
+
+/* ---------- 小工具 ---------- */
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+function boxBlurH(src, dst, w, h, r) {
+  const norm = 1 / (2 * r + 1);
+  for (let y = 0; y < h; y++) {
+    const o = y * w, first = src[o], last = src[o + w - 1];
+    let acc = first * (r + 1);
+    for (let k = 1; k <= r; k++) acc += src[o + (k < w ? k : w - 1)];
+    for (let x = 0; x < w; x++) {
+      dst[o + x] = acc * norm;
+      const add = x + r + 1, sub = x - r;
+      acc += (add < w ? src[o + add] : last) - (sub >= 0 ? src[o + sub] : first);
+    }
+  }
+}
+function boxBlurV(src, dst, w, h, r) {
+  const norm = 1 / (2 * r + 1), acc = new Float64Array(w);
+  for (let x = 0; x < w; x++) acc[x] = src[x] * (r + 1);
+  for (let k = 1; k <= r; k++) {
+    const o = (k < h ? k : h - 1) * w;
+    for (let x = 0; x < w; x++) acc[x] += src[o + x];
+  }
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    for (let x = 0; x < w; x++) dst[o + x] = acc[x] * norm;
+    const ao = (y + r + 1 < h ? y + r + 1 : h - 1) * w, so = (y - r >= 0 ? y - r : 0) * w;
+    for (let x = 0; x < w; x++) acc[x] += src[ao + x] - src[so + x];
+  }
+}
+// 三次盒式模糊逼近高斯。只用于离屏的分析量（方向场、误差图、取色用的参考图），不碰画面。
+function gaussBlur(src, w, h, sigma) {
+  if (sigma < 0.3) return src;
+  const ideal = Math.sqrt(4 * sigma * sigma + 1);
+  let wl = Math.floor(ideal); if (wl % 2 === 0) wl--;
+  const m = Math.round((12 * sigma * sigma - 3 * wl * wl - 12 * wl - 9) / (-4 * wl - 4));
+  let a = new Float32Array(src), b = new Float32Array(src.length);
+  for (let i = 0; i < 3; i++) {
+    const r = ((i < m ? wl : wl + 2) - 1) >> 1;
+    if (r < 1) continue;
+    boxBlurH(a, b, w, h, r); boxBlurV(b, a, w, h, r);
+  }
+  return a;
+}
+
+function makeValueNoise(seed) {
+  const g = new Float32Array(64 * 64), r = mulberry32(seed);
+  for (let i = 0; i < g.length; i++) g[i] = r();
+  return function (u, v) {
+    const x0 = Math.floor(u), y0 = Math.floor(v), fx = u - x0, fy = v - y0;
+    const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const xa = x0 & 63, xb = (x0 + 1) & 63, ya = (y0 & 63) << 6, yb = ((y0 + 1) & 63) << 6;
+    const top = g[ya | xa] + (g[ya | xb] - g[ya | xa]) * sx;
+    const bot = g[yb | xa] + (g[yb | xb] - g[yb | xa]) * sx;
+    return top + (bot - top) * sy;
+  };
+}
+
+/* ---------- 画家的状态 ---------- */
+
+const canvas = document.getElementById("painting");
+let ctx = null;
+const F = {};          // 离屏量：参考色、方向场、重要度
+let S = null;          // 作画进度
+
+/* ---------- setup：把参考图读进内存，只取色，不上屏 ---------- */
+
+async function setup() {
+  const img = new Image();
+  img.src = REFERENCE_SRC;
+  await img.decode();
+  const W = F.W = img.naturalWidth, H = F.H = img.naturalHeight, n = W * H;
+  const U = F.unit = Math.sqrt(W * H) / BASE_SIDE;
+  F.passes = CONFIG.passes.map(p => ({
+    ...p, base: p.width, width: p.width * U, seg: p.seg * U, spacing: p.spacing * U, refSigma: p.refSigma * U,
+  }));
+
+  const off = document.createElement("canvas");      // 隐藏的参考画布，从不挂进页面
+  off.width = W; off.height = H;
+  const octx = off.getContext("2d", { willReadFrequently: true });
+  octx.fillStyle = "#fff"; octx.fillRect(0, 0, W, H);  // 透明的地方按白纸算
+  octx.drawImage(img, 0, 0);
+  const px = octx.getImageData(0, 0, W, H).data;
+  const r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) { r[i] = px[j]; g[i] = px[j + 1]; b[i] = px[j + 2]; }
+  F.ref = { r, g, b };
+
+  // 暗角只在画面四周本来就偏暗时才加，免得把浅色背景的角落抹灰
+  const band = Math.max(2, Math.round(Math.min(W, H) * 0.06));
+  let lum = 0, cnt = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (x >= band && x < W - band && y >= band && y < H - band) { x = W - band - 1; continue; }
+      const i = y * W + x;
+      lum += 0.3 * r[i] + 0.59 * g[i] + 0.11 * b[i]; cnt++;
+    }
+  }
+  F.vignette = USER_CONFIG.vignette != null ? USER_CONFIG.vignette
+    : CONFIG.finish.vignette * clamp((0.8 - lum / cnt / 255) / 0.5, 0, 1);
+
+  // 每一遍取色用的参考图：笔越宽，取的是越大一片的平均色
+  const cache = new Map([[0, F.ref]]);
+  F.refFor = F.passes.map(p => {
+    if (!cache.has(p.refSigma)) {
+      cache.set(p.refSigma, {
+        r: gaussBlur(r, W, H, p.refSigma), g: gaussBlur(g, W, H, p.refSigma), b: gaussBlur(b, W, H, p.refSigma),
+      });
+    }
+    return cache.get(p.refSigma);
+  });
+
+  F.orderNoise = makeValueNoise(CONFIG.seed + 7);
+  buildFlow();
+  buildImportance();
+
+  const s = CONFIG.scale;
+  canvas.width = W * s; canvas.height = H * s;
+  ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const fin = CONFIG.finish;
+  F.glintFrames = CONFIG.glints.length ? fin.glintFrames : 0;
+  F.vignetteFrames = F.vignette > 0.004 ? fin.vignetteFrames : 0;
+  F.totalFrames = F.passes.reduce((a, p) => a + p.frames, 0) + F.glintFrames + F.vignetteFrames + fin.weaveFrames;
+  reset();
+}
+
+/* ---------- buildFlow：笔触往哪个方向走 ---------- */
+
+// 方向取结构张量的切线（沿着轮廓走，而不是顺着梯度横穿轮廓）。
+// 平坦处没有轮廓，改由低频噪声给方向，否则笔触会原地打转。
+function buildFlow() {
+  const { W, H } = F, n = W * H, { r, g, b } = F.ref, U = F.unit;
+  const n1 = makeValueNoise(CONFIG.seed + 1), n2 = makeValueNoise(CONFIG.seed + 2), nA = 250 * U, nB = 97 * U;
+  F.flow = CONFIG.flowScales.map(([sigmaPre, sigmaInt]) => {
+    sigmaPre *= U; sigmaInt *= U;
+    let jxx = new Float32Array(n), jxy = new Float32Array(n), jyy = new Float32Array(n);
+    for (const src of [r, g, b]) {
+      const c = gaussBlur(src, W, H, sigmaPre);
+      for (let y = 1; y < H - 1; y++) {
+        for (let x = 1, i = y * W + 1; x < W - 1; x++, i++) {
+          const gx = (c[i - W + 1] + 2 * c[i + 1] + c[i + W + 1] - c[i - W - 1] - 2 * c[i - 1] - c[i + W - 1]) * 0.125;
+          const gy = (c[i + W - 1] + 2 * c[i + W] + c[i + W + 1] - c[i - W - 1] - 2 * c[i - W] - c[i - W + 1]) * 0.125;
+          jxx[i] += gx * gx; jxy[i] += gx * gy; jyy[i] += gy * gy;
+        }
+      }
+    }
+    jxx = gaussBlur(jxx, W, H, sigmaInt); jxy = gaussBlur(jxy, W, H, sigmaInt); jyy = gaussBlur(jyy, W, H, sigmaInt);
+
+    const edge = new Float32Array(n), coh = new Float32Array(n), angle = new Float32Array(n);
+    const hist = new Uint32Array(1024);
+    for (let i = 0; i < n; i++) {
+      const d = Math.hypot(jxx[i] - jyy[i], 2 * jxy[i]), tr = jxx[i] + jyy[i];
+      edge[i] = Math.sqrt((tr + d) * 0.5);
+      coh[i] = d / (tr + 1e-3);
+      hist[Math.min(1023, edge[i] * 8 | 0)]++;
+    }
+    // 用 99 分位做归一，免得被个别极强的边带偏；下限防止几乎全平的图把噪点当成轮廓
+    let acc = 0, top = 1023;
+    for (let k = 0; k < 1024; k++) { acc += hist[k]; if (acc >= n * 0.99) { top = k; break; } }
+    const norm = 8 / Math.max(16, top);
+
+    for (let y = 0, i = 0; y < H; y++) {
+      for (let x = 0; x < W; x++, i++) {
+        const e = edge[i] = Math.min(1, edge[i] * norm);
+        const d = Math.hypot(jxx[i] - jyy[i], 2 * jxy[i]) + 1e-6;
+        const ws = smoothstep(0.03, 0.16, e) * smoothstep(0.12, 0.5, coh[i]);
+        const na = 8.2 * (0.65 * n1(x / nA, y / nA) + 0.35 * n2(x / nB, y / nB));
+        // 方向没有正反之分，所以在二倍角空间里混合
+        const vx = ws * (jyy[i] - jxx[i]) / d + (1 - ws) * Math.cos(2 * na);
+        const vy = ws * (-2 * jxy[i]) / d + (1 - ws) * Math.sin(2 * na);
+        angle[i] = 0.5 * Math.atan2(vy, vx);
+        coh[i] *= smoothstep(0.03, 0.16, e);
+      }
+    }
+    return { angle, coh, edge };
+  });
+}
+
+// 重要度 = max(轮廓强度, 重点区域)。细笔按它决定落不落。
+function buildImportance() {
+  const { W, H } = F, n = W * H, edge = F.flow[2].edge;
+  const imp = F.importance = new Float32Array(n), focus = F.focus = new Float32Array(n);
+  for (const f of CONFIG.focus) {
+    const cx = f.c[0] * W, cy = f.c[1] * H, rx = f.r[0] * W, ry = f.r[1] * W;
+    const x0 = Math.max(0, cx - rx * 1.4 | 0), x1 = Math.min(W - 1, Math.ceil(cx + rx * 1.4));
+    const y0 = Math.max(0, cy - ry * 1.4 | 0), y1 = Math.min(H - 1, Math.ceil(cy + ry * 1.4));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const v = (f.w ?? 1) * smoothstep(1.35, 0.8, Math.hypot((x - cx) / rx, (y - cy) / ry));
+        const i = y * W + x;
+        if (v > focus[i]) focus[i] = v;
+      }
+    }
+  }
+  let sw = 0, sx = 0, sy = 0;
+  for (let y = 0, i = 0; y < H; y++) {
+    for (let x = 0; x < W; x++, i++) {
+      const v = imp[i] = Math.max(focus[i], smoothstep(0.1, 0.55, edge[i]));
+      sw += v; sx += v * x; sy += v * y;
+    }
+  }
+  // 没指定主体中心，就取重要度的重心：轮廓和重点区域最集中的地方
+  F.center = CONFIG.center || (sw > 0 ? [sx / sw / W, sy / sw / H] : [0.5, 0.5]);
+}
+
+/* ---------- planPasses：每一遍开始前，看画布和参考图差在哪，决定这一遍落哪些笔 ---------- */
+
+function snapshot() {
+  const { W, H } = F, s = CONFIG.scale, n = W * H;
+  const px = ctx.getImageData(0, 0, W * s, H * s).data, row = W * s * 4, k = 1 / (s * s);
+  const r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n);
+  for (let y = 0, i = 0; y < H; y++) {
+    for (let x = 0; x < W; x++, i++) {
+      let sr = 0, sg = 0, sb = 0;
+      for (let dy = 0; dy < s; dy++) {
+        let j = (y * s + dy) * row + x * s * 4;
+        for (let dx = 0; dx < s; dx++, j += 4) { sr += px[j]; sg += px[j + 1]; sb += px[j + 2]; }
+      }
+      r[i] = sr * k; g[i] = sg * k; b[i] = sb * k;
+    }
+  }
+  return { r, g, b };
+}
+
+function colorError(a, b) {
+  const n = F.W * F.H, e = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const dr = a.r[i] - b.r[i], dg = a.g[i] - b.g[i], db = a.b[i] - b.b[i];
+    e[i] = Math.sqrt((2 * dr * dr + 4 * dg * dg + 3 * db * db) / 9);
+  }
+  return e;
+}
+
+function planPass(pi) {
+  const p = F.passes[pi], { W, H } = F, U = F.unit;
+  const rng = mulberry32(CONFIG.seed ^ Math.imul(pi + 1, 0x9E3779B1));
+  const ref = F.refFor[pi], refR = ref.r, refG = ref.g, refB = ref.b;
+  const { angle, coh } = F.flow[p.flow];
+  const snap = pi > 0 ? snapshot() : null;
+  const err = snap ? gaussBlur(colorError(snap, F.ref), W, H, p.width * 0.35) : null;
+  const imp = F.importance, focus = F.focus, o = p.order;
+  const seg = p.seg, stop2 = p.stop * p.stop * 9, keep2 = 4 * 4 * 9;
+  const jl = 0.012 + 0.0024 * p.base, jc = 0.4 + 0.13 * p.base;     // 色彩扰动随笔宽缩放，细笔几乎不抖
+  const spatialW = o.spatial || 0, lightW = o.light || 0, focusW = o.focus || 0;
+
+  let cap = 1 << 16, np = 0, ns = 0;
+  let pts = new Float32Array(cap * 2), offs = new Uint32Array(cap + 1), col = new Uint8ClampedArray(cap * 3);
+  let wid = new Float32Array(cap), key = new Float32Array(cap);
+  const back = new Float32Array(64), fwd = new Float32Array(64);
+  let cr = 0, cg = 0, cb = 0;
+
+  // 沿方向场走几小段；沿途颜色和笔上的颜色差得多了，或者拐角太急，就收笔
+  function walk(x, y, dx, dy, maxSegs, out) {
+    let m = 0;
+    for (let k = 0; k < maxSegs; k++) {
+      const nx = x + dx * seg, ny = y + dy * seg;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) break;
+      const i = (ny | 0) * W + (nx | 0);
+      const dr = refR[i] - cr, dg = refG[i] - cg, db = refB[i] - cb;
+      const dStroke = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+      if (dStroke > stop2) break;
+      if (snap) {       // 这里画布上已有的颜色明显比这一笔更准，就别盖它
+        const er = refR[i] - snap.r[i], eg = refG[i] - snap.g[i], eb = refB[i] - snap.b[i];
+        if (2 * er * er + 4 * eg * eg + 3 * eb * eb + keep2 < dStroke) break;
+      }
+      out[2 * m] = nx; out[2 * m + 1] = ny; m++;
+      x = nx; y = ny;
+      const a = angle[i];
+      let fx = Math.cos(a), fy = Math.sin(a), dot = fx * dx + fy * dy;
+      if (dot < 0) { fx = -fx; fy = -fy; dot = -dot; }
+      if (dot < 0.35) break;
+      dx = dx * 0.4 + fx * 0.6; dy = dy * 0.4 + fy * 0.6;
+      const l = Math.hypot(dx, dy); dx /= l; dy /= l;
+    }
+    return m;
+  }
+
+  const cols = Math.ceil(W / p.spacing), rows = Math.ceil(H / p.spacing);
+  for (let gy = 0; gy < rows; gy++) {
+    for (let gx = 0; gx < cols; gx++) {
+      const x = Math.min(W - 0.01, (gx + rng()) * p.spacing), y = Math.min(H - 0.01, (gy + rng()) * p.spacing);
+      const i0 = (y | 0) * W + (x | 0);
+      if (err) {
+        const e = err[i0];
+        if (e < p.errLo) continue;
+        if (imp[i0] < p.impMin && e < p.errHi) continue;
+      }
+      cr = refR[i0]; cg = refG[i0]; cb = refB[i0];
+      const a0 = angle[i0] + (rng() - 0.5) * p.wobble;
+      let dx = Math.cos(a0), dy = Math.sin(a0);
+      if (rng() < 0.5) { dx = -dx; dy = -dy; }
+      const maxSegs = Math.max(1, Math.round(p.maxSegs * (0.55 + 0.9 * coh[i0]) * (0.75 + 0.5 * rng())));
+      const nb = walk(x, y, -dx, -dy, maxSegs, back), nf = walk(x, y, dx, dy, maxSegs, fwd);
+
+      if (ns + 1 >= cap || np + nb + nf + 3 >= cap) {
+        cap *= 2;
+        const grow = (old, len, Ctor) => { const a = new Ctor(len); a.set(old); return a; };
+        pts = grow(pts, cap * 2, Float32Array); offs = grow(offs, cap + 1, Uint32Array);
+        col = grow(col, cap * 3, Uint8ClampedArray); wid = grow(wid, cap, Float32Array); key = grow(key, cap, Float32Array);
+      }
+      offs[ns] = np;
+      if (nb + nf === 0) {            // 走不出去，就地点一下
+        const h = Math.min(0.3 * p.width, 0.6 * seg);
+        pts[2 * np] = x - dx * h; pts[2 * np + 1] = y - dy * h; np++;
+        pts[2 * np] = x + dx * h; pts[2 * np + 1] = y + dy * h; np++;
+      } else {
+        for (let k = nb - 1; k >= 0; k--) { pts[2 * np] = back[2 * k]; pts[2 * np + 1] = back[2 * k + 1]; np++; }
+        pts[2 * np] = x; pts[2 * np + 1] = y; np++;
+        for (let k = 0; k < nf; k++) { pts[2 * np] = fwd[2 * k]; pts[2 * np + 1] = fwd[2 * k + 1]; np++; }
+      }
+
+      // 偏色的幅度还要随明度收小：近黑的背景上同样的偏差会变成一条条彩色的笔触
+      const lj = 1 + (rng() - 0.5) * 2 * jl;
+      const jcl = jc * Math.min(1, 0.08 + (0.3 * cr + 0.59 * cg + 0.11 * cb) / 150);
+      col[3 * ns] = cr * lj + (rng() - 0.5) * 2 * jcl;
+      col[3 * ns + 1] = cg * lj + (rng() - 0.5) * 2 * jcl;
+      col[3 * ns + 2] = cb * lj + (rng() - 0.5) * 2 * jcl;
+      wid[ns] = p.width * (0.85 + 0.3 * rng());
+
+      // 落笔次序：一部分跟着画笔在画面上移动的路线，一部分先暗后亮，剩下的随手
+      let sp = 0;
+      if (o.radial) sp = Math.hypot(x / W - F.center[0], (y / H - F.center[1]) * H / W) / 0.9;
+      else if (o.dir) {
+        const u = o.dir[0] < 0 ? 1 - x / W : x / W, v = o.dir[1] < 0 ? 1 - y / H : y / H;
+        sp = (u * Math.abs(o.dir[0]) + v * Math.abs(o.dir[1])) / (Math.abs(o.dir[0]) + Math.abs(o.dir[1]));
+      }
+      sp += (F.orderNoise(x / (140 * U) + pi * 9.7, y / (140 * U)) - 0.5) * 0.35;
+      const lum = (0.3 * cr + 0.59 * cg + 0.11 * cb) / 255;
+      key[ns] = spatialW * sp + lightW * lum + focusW * focus[i0] + (1 - spatialW - lightW - focusW) * rng();
+      ns++;
+    }
+  }
+  offs[ns] = np;
+  const order = new Uint32Array(ns);
+  for (let i = 0; i < ns; i++) order[i] = i;
+  order.sort((a, b) => key[a] - key[b]);
+  return { p, pi, n: ns, pts, offs, col, wid, order, seed: CONFIG.seed + pi * 7919 };
+}
+
+/* ---------- dab：一笔 ---------- */
+
+const NX = new Float32Array(40), NY = new Float32Array(40);
+const rgb = (r, g, b) => "rgb(" + clamp(Math.round(r), 0, 255) + "," + clamp(Math.round(g), 0, 255) + "," + clamp(Math.round(b), 0, 255) + ")";
+
+// 把笔触中线向一侧平移 off，并只取参数 u0..u1 这一段（可以略微伸出两端）
+function offsetPath(pts, o, n, off, u0, u1) {
+  const last = n - 1;
+  const qx = i => pts[o + 2 * i] + NX[i] * off, qy = i => pts[o + 2 * i + 1] + NY[i] * off;
+  ctx.beginPath();
+  if (u0 <= 0) ctx.moveTo(qx(0) + (qx(0) - qx(1)) * -u0, qy(0) + (qy(0) - qy(1)) * -u0);
+  else { const i = Math.min(last - 1, u0 | 0), t = u0 - i; ctx.moveTo(qx(i) + (qx(i + 1) - qx(i)) * t, qy(i) + (qy(i + 1) - qy(i)) * t); }
+  for (let i = Math.max(1, Math.floor(u0) + 1); i < last && i < u1; i++) ctx.lineTo(qx(i), qy(i));
+  if (u1 >= last) ctx.lineTo(qx(last) + (qx(last) - qx(last - 1)) * (u1 - last), qy(last) + (qy(last) - qy(last - 1)) * (u1 - last));
+  else { const i = Math.max(0, u1 | 0), t = u1 - i; ctx.lineTo(qx(i) + (qx(i + 1) - qx(i)) * t, qy(i) + (qy(i + 1) - qy(i)) * t); }
+}
+
+function dab(plan, k) {
+  const p = plan.p, pts = plan.pts;
+  const first = plan.offs[k], n = plan.offs[k + 1] - first, o = first * 2;
+  const r = plan.col[3 * k], g = plan.col[3 * k + 1], b = plan.col[3 * k + 2], w = plan.wid[k];
+
+  // 笔身：几小段连成略弯的线，圆头
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = rgb(r, g, b);
+  ctx.lineWidth = p.bristles ? w * 0.8 : w;
+  ctx.beginPath();
+  ctx.moveTo(pts[o], pts[o + 1]);
+  for (let i = 1; i < n; i++) ctx.lineTo(pts[o + 2 * i], pts[o + 2 * i + 1]);
+  ctx.stroke();
+  if (!p.bristles && !p.edge) return;
+
+  for (let i = 0; i < n; i++) {
+    const a = o + 2 * Math.max(0, i - 1), c = o + 2 * Math.min(n - 1, i + 1);
+    const tx = pts[c] - pts[a], ty = pts[c + 1] - pts[a + 1], l = Math.hypot(tx, ty) || 1;
+    NX[i] = -ty / l; NY[i] = tx / l;
+  }
+  let h = (Math.imul(k + 1, 0x9E3779B1) ^ plan.seed) | 1;
+  const rnd = () => { h ^= h << 13; h ^= h >>> 17; h ^= h << 5; return (h >>> 0) / 4294967296; };
+
+  // 笔毛：每根蘸的颜料深浅略有不同，长短不齐，所以笔触里有丝缕、两头是毛的
+  if (p.bristles) {
+    const K = p.bristles;
+    ctx.lineWidth = w * 0.9 / K * 1.3;
+    ctx.globalAlpha = 0.85;
+    for (let j = 0; j < K; j++) {
+      const off = ((j + 0.5) / K - 0.5 + (rnd() - 0.5) * 0.5 / K) * w * 0.9;
+      const sh = 1 + (rnd() - 0.5) * 2 * p.streak, d = (rnd() - 0.5) * Math.min(5, 0.5 + (r + g + b) / 60);
+      ctx.strokeStyle = rgb(r * sh + d, g * sh + d, b * sh + d);
+      offsetPath(pts, o, n, off, -0.45 + rnd() * 0.75, n - 1 + 0.45 - rnd() * 0.75);
+      ctx.stroke();
+    }
+  }
+
+  // 颜料厚度：朝光的一侧一道淡亮线，背光的一侧一道暗线
+  if (p.edge) {
+    const m = n >> 1, facing = NX[m] * CONFIG.light[0] + NY[m] * CONFIG.light[1];
+    const side = facing >= 0 ? 1 : -1;
+    ctx.lineWidth = Math.max(0.45, w * 0.07);
+    ctx.globalAlpha = p.edge * (0.35 + 0.65 * Math.abs(facing));
+    ctx.strokeStyle = rgb(r * 1.2 + 8, g * 1.2 + 7, b * 1.2 + 5);
+    offsetPath(pts, o, n, side * w * 0.44, 0, n - 1); ctx.stroke();
+    ctx.strokeStyle = rgb(r * 0.7, g * 0.7, b * 0.7);
+    offsetPath(pts, o, n, -side * w * 0.44, 0, n - 1); ctx.stroke();
+  }
+}
+
+/* ---------- 收尾：高光、暗角、画布纹理 ---------- */
+
+function glint(step) {
+  const { W, H } = F, lum = i => 0.3 * F.ref.r[i] + 0.59 * F.ref.g[i] + 0.11 * F.ref.b[i];
+  ctx.globalCompositeOperation = "screen";
+  for (const gl of CONFIG.glints) {
+    const radius = gl.radius * F.unit;
+    if (!gl.at) {
+      const cx = gl.c[0] * W, cy = gl.c[1] * H, rad = gl.search * W;
+      let best = -1, bx = cx, by = cy;
+      for (let y = Math.max(1, cy - rad | 0); y <= Math.min(H - 2, cy + rad); y++) {
+        for (let x = Math.max(1, cx - rad | 0); x <= Math.min(W - 2, cx + rad); x++) {
+          if (Math.hypot(x - cx, y - cy) > rad) continue;
+          const i = y * W + x, v = lum(i) * 2 + lum(i - 1) + lum(i + 1) + lum(i - W) + lum(i + W);
+          if (v > best) { best = v; bx = x + 0.5; by = y + 0.5; }
+        }
+      }
+      gl.at = [bx, by];
+    }
+    const grad = ctx.createRadialGradient(gl.at[0], gl.at[1], 0, gl.at[0], gl.at[1], radius);
+    grad.addColorStop(0, "rgba(255,248,230," + gl.alpha * step + ")");
+    grad.addColorStop(0.4, "rgba(255,240,210," + gl.alpha * step * 0.4 + ")");
+    grad.addColorStop(1, "rgba(255,240,210,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(gl.at[0] - radius, gl.at[1] - radius, radius * 2, radius * 2);
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function vignette(step) {
+  const { W, H } = F, cx = W * 0.5, cy = H * 0.5, far = Math.hypot(W, H) * 0.62;
+  const grad = ctx.createRadialGradient(cx, cy, far * 0.5, cx, cy, far);
+  grad.addColorStop(0, "rgba(12,8,4,0)");
+  grad.addColorStop(1, "rgba(12,8,4," + F.vignette * step + ")");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// 画布的经纬线，自上而下一段一段织出来
+function weave(t0, t1) {
+  const { W, H } = F, wv = CONFIG.finish.weave, y0 = H * t0, y1 = H * t1;
+  const pitch = Math.max(1.5, wv.pitch * F.unit);
+  const hash = i => { let h = Math.imul(i + 11, 0x9E3779B1); h ^= h >>> 15; return ((h >>> 0) % 1000) / 1000; };
+  ctx.lineWidth = pitch * 0.26;
+  ctx.lineCap = "butt";
+  for (let k = Math.ceil(y0 / pitch); k * pitch < y1; k++) {
+    const y = k * pitch;
+    ctx.strokeStyle = "rgba(0,0,0," + wv.dark * (0.5 + hash(k)) + ")";
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,244,222," + wv.light * (0.5 + hash(k + 5000)) + ")";
+    ctx.beginPath(); ctx.moveTo(0, y + pitch * 0.5); ctx.lineTo(W, y + pitch * 0.5); ctx.stroke();
+  }
+  for (let k = 0; k * pitch < W; k++) {
+    const x = k * pitch;
+    ctx.strokeStyle = "rgba(0,0,0," + wv.dark * (0.5 + hash(k + 9000)) + ")";
+    ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,244,222," + wv.light * (0.5 + hash(k + 14000)) + ")";
+    ctx.beginPath(); ctx.moveTo(x + pitch * 0.5, y0); ctx.lineTo(x + pitch * 0.5, y1); ctx.stroke();
+  }
+  ctx.lineCap = "round";
+}
+
+/* ---------- draw：一帧一帧画 ---------- */
+
+function reset() {
+  const { W, H } = F, s = CONFIG.scale, [gr, gg, gb] = CONFIG.ground;
+  ctx.setTransform(s, 0, 0, s, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = rgb(gr, gg, gb);
+  ctx.fillRect(0, 0, W, H);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const gl of CONFIG.glints) gl.at = null;
+  S = { frame: 0, pass: -1, passFrame: 0, plan: null, drawn: 0, strokes: 0, perPass: [], finishFrame: 0, done: false, stats: null, phase: "准备画布" };
+}
+
+function measure() {
+  const snap = snapshot(), n = F.W * F.H;
+  let abs = 0, sq = 0;
+  for (const c of ["r", "g", "b"]) {
+    const a = snap[c], b = F.ref[c];
+    for (let i = 0; i < n; i++) { const d = a[i] - b[i]; abs += Math.abs(d); sq += d * d; }
+  }
+  const mse = sq / (3 * n);
+  return { mae: abs / (3 * n) / 255 * 100, psnr: 10 * Math.log10(255 * 255 / mse) };
+}
+
+function stepFrame() {
+  if (S.done) return info();
+  const passes = F.passes, fin = CONFIG.finish;
+
+  if (S.pass < passes.length && (S.pass < 0 || S.passFrame >= passes[S.pass].frames)) {
+    S.pass++; S.passFrame = 0; S.drawn = 0;
+    if (S.pass < passes.length) {
+      S.plan = planPass(S.pass);
+      S.perPass.push(S.plan.n);
+      const p = passes[S.pass], width = +p.width.toFixed(1);
+      S.phase = "第 " + (S.pass + 1) + " / " + passes.length + " 遍 · " + p.name + " · 笔宽 " + width + " px";
+      console.log("[画笔] 第 " + (S.pass + 1) + " 遍 " + p.name + "：笔宽 " + width + " px，" + S.plan.n.toLocaleString() + " 笔");
+    } else {
+      S.plan = null;
+      S.beforeFinish = measure();
+    }
+  }
+
+  if (S.pass < passes.length) {
+    const p = passes[S.pass], plan = S.plan;
+    S.passFrame++;
+    const target = S.passFrame >= p.frames ? plan.n : Math.round(plan.n * Math.pow(S.passFrame / p.frames, p.ease));
+    for (; S.drawn < target; S.drawn++) dab(plan, plan.order[S.drawn]);
+    S.strokes = S.perPass.reduce((a, b) => a + b, 0) - plan.n + S.drawn;
+  } else {
+    const j = S.finishFrame++;
+    if (j < F.glintFrames) { S.phase = "收尾 · 高光"; glint(1 / F.glintFrames); }
+    else if (j < F.glintFrames + F.vignetteFrames) { S.phase = "收尾 · 暗角"; vignette(1 / F.vignetteFrames); }
+    else {
+      S.phase = "收尾 · 画布纹理";
+      const k = j - F.glintFrames - F.vignetteFrames;
+      weave(k / fin.weaveFrames, (k + 1) / fin.weaveFrames);
+    }
+  }
+
+  S.frame++;
+  if (S.frame >= F.totalFrames) {
+    S.done = true;
+    S.phase = "完成";
+    S.stats = { strokes: S.strokes, perPass: S.perPass.slice(), frames: S.frame, beforeFinish: S.beforeFinish, final: measure() };
+    console.log("[画笔] 总笔数：" + S.strokes.toLocaleString() + "，共 " + S.frame + " 帧");
+    console.log("[画笔] 与参考图相比：平均绝对误差 " + S.stats.final.mae.toFixed(2) + "%，PSNR " + S.stats.final.psnr.toFixed(1) + " dB");
+  }
+  return info();
+}
+
+function info() {
+  return { frame: S.frame, totalFrames: F.totalFrames, pass: S.pass, phase: S.phase, strokes: S.strokes, done: S.done, stats: S.stats };
+}
+
+/* ---------- 界面 ---------- */
+
+const ui = {
+  pass: document.getElementById("passLabel"), counts: document.getElementById("counts"),
+  bar: document.getElementById("bar"), play: document.getElementById("btnPlay"),
+  step: document.getElementById("btnStep"), restart: document.getElementById("btnRestart"),
+  speed: document.getElementById("speed"), save: document.getElementById("btnSave"),
+};
+let playing = true, speed = 1, clock = 0, lastTick = 0;
+
+function buildBar() {
+  const parts = F.passes.map(p => p.frames);
+  parts.push(F.glintFrames + F.vignetteFrames + CONFIG.finish.weaveFrames);
+  ui.bar.innerHTML = "";
+  ui.fills = parts.map(f => {
+    const span = document.createElement("span"), fill = document.createElement("i");
+    span.style.flex = f; span.appendChild(fill); ui.bar.appendChild(span);
+    return { fill, frames: f };
+  });
+}
+
+function updateHud() {
+  ui.pass.textContent = S.done ? "完成 · 共 " + S.strokes.toLocaleString() + " 笔" : S.phase;
+  ui.counts.textContent = S.strokes.toLocaleString() + " 笔 · 第 " + S.frame + " / " + F.totalFrames + " 帧";
+  let left = S.frame;
+  for (const part of ui.fills) {
+    part.fill.style.width = clamp(left / part.frames, 0, 1) * 100 + "%";
+    left -= part.frames;
+  }
+  ui.play.textContent = S.done ? "已完成" : playing ? "暂停" : "继续";
+  ui.play.disabled = S.done;
+  ui.step.disabled = S.done || playing;
+}
+
+function tick(t) {
+  if (playing && !S.done) {
+    clock += Math.min(0.25, (t - lastTick) / 1000) * CONFIG.fps * speed;
+    let n = Math.min(6, Math.floor(clock));
+    clock -= Math.floor(clock);
+    while (n-- > 0 && !S.done) stepFrame();
+    updateHud();
+  }
+  lastTick = t;
+  requestAnimationFrame(tick);
+}
+
+ui.play.onclick = () => { playing = !playing; updateHud(); };
+ui.step.onclick = () => { stepFrame(); updateHud(); };
+ui.restart.onclick = () => { reset(); playing = true; clock = 0; updateHud(); };
+ui.speed.onchange = () => { speed = +ui.speed.value; };
+ui.save.onclick = () => canvas.toBlob(blob => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "painting-frame-" + String(S.frame).padStart(4, "0") + ".png";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); ui.play.click(); }
+  else if (e.code === "ArrowRight" && !playing) ui.step.click();
+});
+
+/* ---------- 启动 ---------- */
+
+for (const k of ["seed", "scale", "center", "focus", "glints"]) if (USER_CONFIG[k] != null) CONFIG[k] = USER_CONFIG[k];
+if (USER_CONFIG.passes) CONFIG.passes.length = clamp(Math.round(USER_CONFIG.passes), 1, CONFIG.passes.length);
+CONFIG.glints = CONFIG.glints.map(gl => ({ search: 0.015, radius: 3, alpha: 0.25, ...gl }));
+
+const params = new URLSearchParams(location.search);
+if (params.has("scale")) CONFIG.scale = clamp(+params.get("scale") || 2, 1, 3);
+
+// 导出脚本用同一个文件：带 ?export 时不自动播放，由外部逐帧调用 stepFrame()
+const painter = window.painter = {
+  CONFIG, F, stepFrame, info, reset,
+  frameDataURL(type = "image/jpeg", quality = 0.9, scale = 1) {
+    if (scale === CONFIG.scale) return canvas.toDataURL(type, quality);
+    const c = document.createElement("canvas");
+    c.width = F.W * scale; c.height = F.H * scale;
+    const x = c.getContext("2d");
+    x.imageSmoothingQuality = "high";
+    x.drawImage(canvas, 0, 0, c.width, c.height);
+    return c.toDataURL(type, quality);
+  },
+};
+painter.ready = setup().then(() => {
+  buildBar(); updateHud();
+  if (!params.has("export")) requestAnimationFrame(t => { lastTick = t; requestAnimationFrame(tick); });
+});
+</script>
+</body>
+</html>

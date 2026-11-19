@@ -1,0 +1,10 @@
+node_modules/
+output/
+.scratch/
+.DS_Store
+
+# 只收录 README 里展示的三张示例图；自己放进来的其他参考图不会被提交
+reference-image/*
+!reference-image/reference-1.*
+!reference-image/reference-2.*
+!reference-image/reference-3.*
